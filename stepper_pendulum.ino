@@ -8,7 +8,7 @@
 //volatile float k1 = 600.0; volatile  float k2 = 50.0;volatile float k3 = 0.08; volatile float k4 = 3.0; //マイクロステップ1/2 OK
 volatile float k1 = 1200.0; volatile  float k2 = 100.0; volatile float k3 = 0.16; volatile float k4 = 6.0; //マイクロステップ1/4 OK
 //volatile float k1 = 2400.0; volatile  float k2 = 200.0; volatile float k3 = 0.32; volatile float k4 = 12.0; //マイクロステップ1/8 OK
-//
+
 //30mmホイール1/4ステップは49mmと同じパラメータで倒立する
 //volatile int k1 = 1800; volatile  int k2 = 160; volatile int k3 = 0.8; volatile int k4 = 9.0;    //30mmホイール マクロステップ1/4 倒立は安定するが移動してしまう
 
