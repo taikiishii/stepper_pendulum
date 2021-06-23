@@ -1,16 +1,13 @@
 #include <Wire.h>
-#include <SoftwareSerial.h>
 #include <MsTimer2.h>
 #include <TimerOne.h>
 
 // k1:傾き　k2:倒れる速度　k3:位置　k4:移動速度
-//volatile float k1 = 300.0; volatile  float k2 = 25.0;volatile float k3 = 0.04; volatile float k4 = 1.5; //マイクロステップなし OK
-//volatile float k1 = 600.0; volatile  float k2 = 50.0;volatile float k3 = 0.08; volatile float k4 = 3.0; //マイクロステップ1/2 OK
-volatile float k1 = 1200.0; volatile  float k2 = 100.0; volatile float k3 = 0.16; volatile float k4 = 6.0; //マイクロステップ1/4 OK
-//volatile float k1 = 2400.0; volatile  float k2 = 200.0; volatile float k3 = 0.32; volatile float k4 = 12.0; //マイクロステップ1/8 OK
-
-//30mmホイール1/4ステップは49mmと同じパラメータで倒立する
-//volatile int k1 = 1800; volatile  int k2 = 160; volatile int k3 = 0.8; volatile int k4 = 9.0;    //30mmホイール マクロステップ1/4 倒立は安定するが移動してしまう
+//volatile float k1 = 300, k2 = 25, k3 = 10, k4 = 1; //55mmホイール マイクロステップなし
+//volatile float k1 = 600 k2 = 50, k3 = 20 k4 = 3; //55mmホイール マイクロステップ1/2
+volatile float k1 = 1200, k2 = 100, k3 = 40, k4 = 6; //55mmホイール マイクロステップ1/4
+//volatile float k1 = 2400, k2 = 200, k3 = 80, k4 = 12; //55mmホイール マイクロステップ1/8
+//volatile float k1 = 1800, k2 = 160, k3 = 35, k4 = 6;    //30mmホイール マクロステップ1/4
 
 #define DIR_L   2
 #define STEP_L  3
@@ -18,26 +15,25 @@ volatile float k1 = 1200.0; volatile  float k2 = 100.0; volatile float k3 = 0.16
 #define STEP_R  5
 #define EN    6
 
-#define DLY   10   // パルス生成のためのTimer1のタイマ割り込み周期 マイクロ秒単位
-#define LOOPPERIOD 1 // 制御ループの周期 ミリ秒単位
-#define LIMIT 560  // ステッピングモータが脱調しない最大のスピード マイクロステップ1/4=560
-#define MOVESPEED 0 //120
+#define PULSE_PERIOD   10  // パルス生成のためのTimer1のタイマ割り込み周期 マイクロ秒単位
+#define CONTROL_PERIOD 4   // 制御ループの周期 ミリ秒単位
+#define LIMIT 560          // ステッピングモータが脱調しない最大のスピード マイクロステップ1/4=560
+#define MOVESPEED 0        //120
 
-SoftwareSerial mySerial(8, 7); // RX, TX
+volatile bool outL = false, outR = false;
+volatile int countL = 0, countR = 0;
+volatile int speedL = 0, speedR = 0;
+volatile float posL = 0,  posR = 0;
+volatile int turnL = 0, turnR = 0;
+volatile int controlL = 0, controlR = 0;
 
-volatile bool outL = false;
-volatile bool outR = false;
-volatile int countL = 0;
-volatile int countR = 0;
-volatile int speedL = 0;
-volatile int speedR = 0;
-volatile long posL = 0;
-volatile long posR = 0;
-volatile int turnL = 0;
-volatile int turnR = 0;
-volatile int controlL = 0;
-volatile int controlR = 0;
-
+volatile long lastuptime, starttime, currentTime;
+volatile float dt;
+volatile float caribGyroY;
+volatile int16_t rawGyroY;
+volatile float gyroY, degY = 0, dpsY = 0;
+volatile int cmd;
+volatile float lpfY, lpfA = 0.999;
 
 // 加速度・ジャイロセンサーの制御定数
 #define MPU6050_ADDR         0x68 // MPU-6050 device address
@@ -59,18 +55,6 @@ volatile int controlR = 0;
 #define MPU6050_GYRO_ZOUT_L  0x48
 #define MPU6050_PWR_MGMT_1   0x6b
 #define MPU6050_WHO_AM_I     0x75
-
-//倒立振子の制御で使用する変数
-volatile long lastuptime;
-volatile long starttime;
-volatile float dt;
-volatile float caribGyroY;
-volatile float gyroY;
-volatile float degY = 0;
-volatile float dpsY = 0;
-volatile int cmd;
-volatile float lpfY;
-volatile float lpfA = 0.999;
 
 // センサーへのコマンド送信
 void writeMPU6050(byte reg, byte data) {
@@ -98,7 +82,7 @@ byte readMPU6050(byte reg) {
 void setup() {
   Wire.setClock(400000);
   Serial.begin(115200);
-  mySerial.begin(115200);
+  //  mySerial.begin(115200);
   Serial.println("*******************RESTARTED********************");
   Serial.println("*****************stepper_pendulum***************");
   Serial.print(k1); Serial.print(","); Serial.print(k2); Serial.print(","); Serial.print(k3); Serial.print(","); Serial.print(k4); Serial.println();
@@ -109,7 +93,7 @@ void setup() {
 
   // モータードライバ制御用ピンの初期化
   pinMode(DIR_L, OUTPUT);
-  pinMode(STEP_L, OUTPUT);
+  pinMode(STEP_L,  OUTPUT);
   pinMode(DIR_R, OUTPUT);
   pinMode(STEP_R, OUTPUT);
   pinMode(EN, OUTPUT);
@@ -136,9 +120,10 @@ void setup() {
   //ジャイロのゼロ点調整のために静止時の出力を1000回計測して平均を算出
   caribGyroY = 0;
   for (int i = 0; i < 1000  ; i++)  {
-    caribGyroY += (readMPU6050(0x45) << 8) | readMPU6050(0x46);
+    rawGyroY = (readMPU6050(MPU6050_GYRO_YOUT_H) << 8) | readMPU6050(MPU6050_GYRO_YOUT_L);
+    caribGyroY += (float) rawGyroY;
   }
-  caribGyroY /= 1000.0;
+  caribGyroY /= 1000;
   Serial.println("Carib OK.");
 
   // dt計測用
@@ -149,13 +134,15 @@ void setup() {
 
   digitalWrite(EN, LOW);
 
-  Timer1.initialize(DLY); //パルス生成のためのタイマ割込み 引数はマイクロ秒単位
+  Timer1.initialize(PULSE_PERIOD); //パルス生成のためのタイマ割込み 引数はマイクロ秒単位
   Timer1.attachInterrupt(pulse);
-  MsTimer2::set(LOOPPERIOD, controlloop); //制御のためのタイマ割込み 引数はミリ秒単位
+  MsTimer2::set(CONTROL_PERIOD, controlloop); //制御のためのタイマ割込み 引数はミリ秒単位
   MsTimer2::start();
 
   //準備が出来たらLDE 13を点灯
   digitalWrite(13, HIGH);
+  Serial.println("******************** GO !! *********************");
+  //Serial.println("degY,dpsY,pulseSpeed");
 }
 
 void pulse() {
@@ -191,70 +178,71 @@ void controlloop () {
   // 割り込みハンドラの中でI2C通信(割り込み処理を使用）を許可する
   interrupts();
 
-/*  if (mySerial.available() > 0) {  //シリアルモニタで「改行なし」にしてコマンドを入力
-    cmd = mySerial.read();
-    mySerial.println(cmd);
-    switch ((int)cmd) {
-      case 113: //q
-        k1 += 100;
-        break;
-      case 97: //a
-        k1 -= 100;
-        break;
-      case 119: //w
-        k2 += 1.0;
-        break;
-      case 115: //s
-        k2 -= 1.0;
-        break;
-      case 101: //e
-        k3 += 0.01;
-        break;
-      case 100: //d
-        k3 -= 0.01;
-        break;
-      case 114: //r
-        k4 += 1.0;
-        break;
-      case 102: //f
-        k4 -= 1.0;
-        break;
-      case 116: //t
-        mySerial.println("Right");
-        turnL = 1;
-        turnR = -1;
-        break;
-      case 103: //g
-        mySerial.println("Left");
-        turnL = -1;
-        turnR = 1;
-        break;
-      case 121: //y
-        mySerial.println("Forward");
-        turnL = 1;
-        turnR = 1;
-        break;
-      case 104: //h
-        mySerial.println("Back");
-        turnL = -1;
-        turnR = -1;
-        break;
-      case 98: //b
-        mySerial.println("Stop");
-        turnL = 0;
-        turnR = 0;
-        break;
+  /*  if (mySerial.available() > 0) {  //シリアルモニタで「改行なし」にしてコマンドを入力
+      cmd = mySerial.read();
+      mySerial.println(cmd);
+      switch ((int)cmd) {
+        case 113: //q
+          k1 += 100;
+          break;
+        case 97: //a
+          k1 -= 100;
+          break;
+        case 119: //w
+          k2 += 1.0;
+          break;
+        case 115: //s
+          k2 -= 1.0;
+          break;
+        case 101: //e
+          k3 += 0.01;
+          break;
+        case 100: //d
+          k3 -= 0.01;
+          break;
+        case 114: //r
+          k4 += 1.0;
+          break;
+        case 102: //f
+          k4 -= 1.0;
+          break;
+        case 116: //t
+          mySerial.println("Right");
+          turnL = 1;
+          turnR = -1;
+          break;
+        case 103: //g
+          mySerial.println("Left");
+          turnL = -1;
+          turnR = 1;
+          break;
+        case 121: //y
+          mySerial.println("Forward");
+          turnL = 1;
+          turnR = 1;
+          break;
+        case 104: //h
+          mySerial.println("Back");
+          turnL = -1;
+          turnR = -1;
+          break;
+        case 98: //b
+          mySerial.println("Stop");
+          turnL = 0;
+          turnR = 0;
+          break;
+      }
     }
-  }
   */
-  
+
   // dt計測
-  dt = (micros() - lastuptime) * 0.000001;
-  lastuptime = micros();
+  currentTime = micros();
+  dt = (currentTime - lastuptime) * 0.000001;
+  lastuptime = currentTime;
 
   // 角速度を取得
-  gyroY =  (readMPU6050(MPU6050_GYRO_YOUT_H) << 8) | readMPU6050(MPU6050_GYRO_YOUT_L);
-  gyroY -= caribGyroY;
+  rawGyroY = (readMPU6050(MPU6050_GYRO_YOUT_H) << 8) | readMPU6050(MPU6050_GYRO_YOUT_L);
+  gyroY =  (float) rawGyroY - caribGyroY;
   dpsY = gyroY / 131.0;
 
   // 角速度を積算して角度を求める
@@ -265,37 +253,18 @@ void controlloop () {
   lpfY +=  (1 - lpfA) * degY;
 
   // スピードを積算して位置を求める
-  posL += speedL;
-  posR += speedR;
+  posL += speedL *dt;
+  posR += speedR *dt;
 
 
   // 制御量の計算
-  float k1degY; float k2dpsY; float k3posL; float k4speedL;
   speedL += (k1 * (degY - lpfY) + k2 * dpsY + k3 * posL + k4 * speedL) * dt;
   speedR += (k1 * (degY - lpfY) + k2 * dpsY + k3 * posR + k4 * speedR) * dt;
-/*  k1degY = k1 * (degY - lpfY);
-  k2dpsY = k2 * dpsY + k3;
-  k3posL = k3 * posL;
-  k4speedL = k4 * speedL;
 
-  speedL += (k1degY + k2dpsY + k3posL + k4speedL) * dt;
-  speedR = speedL;
-*/
+  // ステッピングモータの最大速度を制限
   speedL = constrain(speedL, 0 - LIMIT, LIMIT);
   speedR = constrain(speedR, 0 - LIMIT, LIMIT);
 
-  //if (abs(speedL) == LIMIT) mySerial.print("LIMIT_L!");
-  //if (abs(speedR) == LIMIT) mySerial.print("LIMIT_R!");
-
-/*
-  Serial.print(k1degY);
-  Serial.print(",");
-  Serial.print(k2dpsY);
-  Serial.print(",");
-  Serial.print(k3posL);
-  Serial.print(",");
-  Serial.println(k4speedL);
-*/
   // 前後進、右左折
   if (turnL > 0) {
     controlL = speedL + MOVESPEED;
